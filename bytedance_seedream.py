@@ -1,21 +1,23 @@
 """
-title: ByteDance Seedream 4.0 Image Generation & Editing Pipe
-description: ByteDance Seedream 4.0 plugin with task model integration
+title: ByteDance Seedream Image Generation & Editing Pipe
+description: ByteDance Seedream plugin with task model integration
 id: seedream-4-5
 author: rbb-dev
 author_url: https://github.com/rbb-dev/
-version: 0.9.1
+version: 0.9.4
 features:
-  - Image generation and editing using ByteDance Seedream 4.0 via API.
-  - Task model analysis to infer intent (generate vs edit), image size, and watermark.
+  - Image generation and editing using ByteDance Seedream via API.
+  - Task model analysis (Structured Outputs / JSON Schema) to infer intent (generate vs edit), image size, watermark, and image usage.
+  - Shows the final prompt used (and how to request verbatim prompting).
+  - Built-in help text (send "help").
   - For edits, preserves original image dimensions unless a resize is explicitly requested.
   - Natural‑language and dimension parsing with size validation and closest‑size mapping.
   - Supported sizes: 1024x1024, 2048x2048, 2304x1728, 1728x2304, 2560x1440, 1440x2560,
-    2496x1664, 1664x2496, 3024x1296, 4096x4096, 6240x2656, plus 1K/2K/4K shorthands.
+    2496x1664, 1664x2496, 3024x1296, 4096x4096, 6240x2656, plus 2K/4K shorthands.
   - Accepts base64 data URIs and Open WebUI file references; handles multiple images with gateway fallback.
   - Streams OpenAI‑compatible responses and emits rich status updates during processing.
   - Uploads generated assets to the WebUI file store and returns Markdown image links.
-  - Configurable via valves (API key, base URL, model, default size, watermark, timeout).
+  - Configurable via valves (API key, base URL, model, default size, watermark, timeout, task model selection).
   - Defensive error handling, logging, and approximate 10 MB per‑image size checks.
 """
 
@@ -100,7 +102,6 @@ class Pipe:
             "4096x4096",
             "6240x2656",
             # Resolution shorthand
-            "1K",
             "2K",
             "4K",
         }
@@ -109,10 +110,10 @@ class Pipe:
     def _apply_logging_valve(self) -> None:
         """Set logger level based on ENABLE_LOGGING valve.
         OFF  -> ERROR only
-        ON   -> INFO and above
+        ON   -> DEBUG and above
         """
         enabled = bool(getattr(self.valves, "ENABLE_LOGGING", False))
-        logger.setLevel(logging.INFO if enabled else logging.ERROR)
+        logger.setLevel(logging.DEBUG if enabled else logging.ERROR)
         # Rely on host/root handlers; do not attach our own to avoid duplicates.
         logger.propagate = True
 
@@ -153,6 +154,45 @@ class Pipe:
         if show_in_chat:
             return f"**✅ {message}**\n\n" if done else f"**⏳ {message}**\n\n"
         return ""
+
+    async def _emit_chat_replace(
+        self,
+        emitter: Optional[Callable[[dict], Awaitable[None]]],
+        content: str,
+    ) -> bool:
+        """Replace current assistant message content via Open WebUI event emitter.
+
+        This is used to show "Using prompt" immediately and keep it visible after images arrive.
+        """
+        if not emitter:
+            return False
+        await emitter({"type": "replace", "data": {"content": content}})
+        return True
+
+    def _help_text(self) -> str:
+        supported_sizes = ", ".join(sorted(self.supported_sizes))
+        return (
+            "Seedream help\n\n"
+            "What this tool does:\n"
+            "- Generates images from text prompts.\n"
+            "- Edits an uploaded image when you attach one and ask to change it.\n\n"
+            "How to generate (text-only):\n"
+            '- "A photorealistic cute kitty, soft studio lighting, 85mm lens."\n'
+            '- "A minimal flat icon of a rocket, white background."\n\n'
+            "How to edit (upload + instructions):\n"
+            '- Upload an image, then say: "Remove the watermark and make the background white."\n'
+            '- Upload an image, then say: "Change the car color to red, keep the same angle."\n\n'
+            "Sizes:\n"
+            "- You can ask for a specific size like \"1024x1024\" or use 2K/4K.\n"
+            f"- Supported sizes: {supported_sizes}\n\n"
+            "Prompt rewriting:\n"
+            "- The tool may clean up/clarify prompts. It will show you the exact \"Using prompt\" text.\n"
+            "- To prevent rewriting, add:\n"
+            '  `Use my prompt verbatim. Don’t embellish or expand it.`\n\n'
+            "Tips:\n"
+            "- If you attach images, mention them explicitly (\"edit this image\", \"use the uploaded image\").\n"
+            "- For best results, be specific about style, lighting, camera, and what to keep unchanged.\n"
+        )
 
     def _get_image_dimensions(
         self, image_data: str
@@ -347,7 +387,7 @@ class Pipe:
         supported_sizes = sorted(self.supported_sizes)
         sizes_list = ", ".join(supported_sizes)
         system_prompt = f"""
-You are the orchestration task model for ByteDance Seedream 4.0 image generation and editing. The payload you receive has:
+You are the orchestration task model for ByteDance Seedream image generation and editing. The payload you receive has:
 - `conversation`: ordered chat history entries (`message_index`, `role`, `text`, `image_refs`). `text` already strips inline image markdown and uses placeholders like `[image:2]` when an attachment is referenced.
 - `raw_user_prompt`: the latest user-written text extracted before post-processing (may still contain noise; prefer `conversation` for context).
 - `defaults`: fallback values (size, watermark) when the user does not specify them.
@@ -360,8 +400,16 @@ Processing checklist BEFORE you answer:
    - IF reference images exist (count > 0) AND the prompt references them → ALWAYS use intent="edit" and select at least one image with action="use"
    - IF reference images exist BUT the prompt says to create something completely new/different/unrelated → use intent="generate" and set all images to action="ignore"
    - IF no reference images exist (count = 0) → ALWAYS use intent="generate"
+3b. DETERMINE IF THE USER WANTS THEIR PROMPT USED VERBATIM (NO REWRITE / NO EMBELLISHMENT):
+   - If the user clearly asks to keep their prompt exact (e.g. "use my prompt verbatim", "don't rewrite", "no embellishment", "use exact wording", "don't expand", etc.), set `use_user_prompt=true`.
+   - The user may phrase this intent many different ways; use your language understanding to detect it.
+   - If `use_user_prompt=true`, keep the user's wording BUT REMOVE the meta/control phrase itself (e.g. remove "don't change my prompt") so the returned `prompt` contains only content instructions for the image model.
+   - Also remove only technical placeholders like `[image:N]` from the final `prompt`.
 4. Determine the final output size, making sure it is one of the supported sizes ({sizes_list}).
 5. Decide watermark behaviour, and craft short explanations for the UI.
+
+User tip phrase you may see (treat it as an example, not a strict requirement):
+- "Use my prompt verbatim. Don’t embellish or expand it."
 
 CRITICAL INTENT DECISION RULES (read this carefully):
 
@@ -468,6 +516,7 @@ CORRECT OUTPUT: {{"intent": "generate", "image_plan": [{{"index": 0, "action": "
 Always respond with ONLY JSON (no markdown fences, no backticks, no prose). The response MUST match this schema:
 {{
   "prompt": string,                // clean prompt to send to the API (NO placeholders like [image:2])
+  "use_user_prompt": boolean,      // true = use user's prompt verbatim (no rewrite); false = use "prompt" as the final prompt
   "intent": "generate" | "edit",   // follow the intent rules above
   "watermark": boolean,            // true = add watermark, false = no watermark
   "size": string,                  // one of: {sizes_list}
@@ -483,6 +532,7 @@ Always respond with ONLY JSON (no markdown fences, no backticks, no prose). The 
 
 Extra rules:
 - prompt MUST NOT include placeholder tokens like [image:2]; describe images as "the uploaded image(s)" instead.
+- If the user asks for verbatim / no rewriting / no embellishment, set use_user_prompt=true and keep prompt aligned to the user's wording, BUT strip meta/control text like "don't change my prompt" from the returned prompt.
 - If intent="edit", image_plan MUST contain at least one entry with action="use".
 - Prefer including one image_plan entry per provided reference image (use or ignore), keeping indices consistent.
 - Do not output any extra keys not shown in the schema.
@@ -609,9 +659,18 @@ Extra rules:
             "additionalProperties": False,
             # OpenAI/OpenRouter Structured Outputs expects all properties to be required;
             # optional fields are represented as nullable values.
-            "required": ["prompt", "intent", "size", "watermark", "resize_target", "image_plan"],
+            "required": [
+                "prompt",
+                "use_user_prompt",
+                "intent",
+                "size",
+                "watermark",
+                "resize_target",
+                "image_plan",
+            ],
             "properties": {
                 "prompt": {"type": "string", "minLength": 1},
+                "use_user_prompt": {"type": "boolean"},
                 "intent": {"type": "string", "enum": ["generate", "edit"]},
                 "watermark": {"type": "boolean"},
                 "size": {"type": "string", "enum": supported_sizes},
@@ -731,6 +790,10 @@ Extra rules:
             raise ValueError("Task model response missing 'prompt'")
         prompt_text = self._strip_image_placeholders(prompt_value)
 
+        if "use_user_prompt" not in params:
+            raise ValueError("Task model response missing 'use_user_prompt'")
+        use_user_prompt = bool(params.get("use_user_prompt"))
+
         intent_raw = str(params.get("intent", "generate")).lower()
         intent = intent_raw if intent_raw in {"generate", "edit"} else "generate"
 
@@ -795,6 +858,7 @@ Extra rules:
 
         return {
             "prompt": prompt_text,
+            "use_user_prompt": use_user_prompt,
             "intent": intent,
             "watermark": watermark,
             "size": size,
@@ -851,7 +915,7 @@ Extra rules:
 
     async def pipes(self) -> List[dict]:
         """Return the manifest entry consumed by Open WebUI."""
-        return [{"id": "seedream-4-5", "name": "ByteDance: Seedream 4.5"}]
+        return [{"id": self.valves.MODEL, "name": "ByteDance: Seedream 4.5"}]
 
     async def pipe(
         self,
@@ -882,6 +946,27 @@ Extra rules:
                     return
                 # Extract structured conversation and images
                 conversation_log, images, last_user_text = await self._collect_conversation_and_images(messages)
+                if (last_user_text or "").strip().lower() in {"help", "/help"}:
+                    help_text = self._help_text()
+                    if __event_emitter__:
+                        await self._emit_chat_replace(__event_emitter__, help_text)
+                        return
+                    if is_stream:
+                        yield self._format_data(
+                            is_stream=True,
+                            model=model,
+                            content=help_text,
+                            finish_reason="stop",
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+                    yield self._format_data(
+                        is_stream=False,
+                        model=model,
+                        content=help_text,
+                        finish_reason="stop",
+                    )
+                    return
                 if not self.valves.API_KEY:
                     yield self._format_data(
                         is_stream=is_stream,
@@ -917,10 +1002,21 @@ Extra rules:
                     __request__,
                     emitter=__event_emitter__,
                 )
-                resolved_prompt = dynamic_params.get("prompt") or last_user_text or ""
-                resolved_prompt = self._strip_image_placeholders(resolved_prompt)
+                raw_user_prompt = self._strip_image_placeholders(last_user_text or "")
+                planned_prompt = self._strip_image_placeholders(dynamic_params.get("prompt") or "")
+                use_user_prompt = bool(dynamic_params.get("use_user_prompt"))
+
+                resolved_prompt = planned_prompt
                 if not resolved_prompt:
                     raise RuntimeError("Task model did not return a prompt")
+
+                prompt_message = f"Using prompt:\n{resolved_prompt}"
+                if (not use_user_prompt) and (resolved_prompt != raw_user_prompt):
+                    prompt_message += (
+                        "\n\n"
+                        '`Tip: If you don’t want me to rewrite your prompt, say: '
+                        '"Use my prompt verbatim. Don’t embellish or expand it."`'
+                    )
                 # Build request JSON using dynamic parameters
                 endpoint = "/images/generations"
                 json_data: Dict[str, Any] = {
@@ -998,6 +1094,19 @@ Extra rules:
                     status_message = (
                         f"Editing image {params_info}..." if is_edit_request else f"Generating image {params_info}..."
                     )
+                # Show users the exact prompt being sent BEFORE calling the API.
+                shown_via_emitter = await self._emit_chat_replace(
+                    __event_emitter__,
+                    prompt_message + "\n\n",
+                )
+                if is_stream and not shown_via_emitter:
+                    yield self._format_data(
+                        is_stream=True,
+                        model=model,
+                        content=prompt_message + "\n\n",
+                        finish_reason=None,
+                    )
+
                 await self.emit_status(status_message, emitter=__event_emitter__)
                 # Make API request
                 try:
@@ -1092,14 +1201,18 @@ Extra rules:
                     elif "url" in item:
                         image_markdown.append(f"![image_{i}]({item['url']})")
                 content = "\n\n".join(image_markdown) if image_markdown else "No images returned."
+                final_content = prompt_message + "\n\n" + content
+                if __event_emitter__:
+                    await self._emit_chat_replace(__event_emitter__, final_content)
                 # Return response
                 if is_stream:
-                    yield self._format_data(
-                        is_stream=True,
-                        model=model,
-                        content=content,
-                        finish_reason=None,
-                    )
+                    if not __event_emitter__:
+                        yield self._format_data(
+                            is_stream=True,
+                            model=model,
+                            content=content,
+                            finish_reason=None,
+                        )
                     yield self._format_data(
                         is_stream=True,
                         model=model,
@@ -1112,7 +1225,7 @@ Extra rules:
                     yield self._format_data(
                         is_stream=False,
                         model=model,
-                        content=content,
+                        content=final_content,
                         usage=response_data.get("usage"),
                         finish_reason="stop",
                     )

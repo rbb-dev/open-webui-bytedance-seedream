@@ -65,7 +65,7 @@ Repository-specific instructions for automated coding agents.
   - Check the live model catalog JSON: `https://openrouter.ai/api/frontend/models`
 
 ## Security & Configuration
-- Never commit real secrets: `OPENROUTER_API_KEY`, `WEBUI_SECRET_KEY`, `ARTIFACT_ENCRYPTION_KEY`.
+- Never commit real secrets, api keys, passwords, usernames, real names, PII data.
 - If changing SSRF guards, artifact persistence, breakers, or adding new valves:
   - Add/extend tests (e.g. `test_security_methods.py`, `test_artifact_helpers.py`).
   - Include a short operator note.

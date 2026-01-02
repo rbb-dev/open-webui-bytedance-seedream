@@ -1,2 +1,0 @@
-"""Open WebUI tools package."""
-

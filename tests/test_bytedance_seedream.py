@@ -68,8 +68,8 @@ def _install_stub_modules():
 
 _install_stub_modules()
 
-from pipes.bytedance_seedream4 import bytedance_seedream4_pipe as seedream_pipe
-from pipes.bytedance_seedream4.bytedance_seedream4_pipe import Pipe
+import bytedance_seedream as seedream_pipe
+from bytedance_seedream import Pipe
 
 
 @pytest.fixture
@@ -86,6 +86,7 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
 
     task_model_payload = {
         "prompt": "Resize this image to 2048x2048 and remove watermark [image:0]",
+        "use_user_prompt": False,
         "intent": "edit",
         "watermark": False,
         "size": "2048x2048",
@@ -135,6 +136,7 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
     )
 
     assert result["prompt"] == "Resize this image to 2048x2048 and remove watermark"
+    assert result["use_user_prompt"] is False
     assert result["intent"] == "edit"
     assert result["use_reference_images"] is True
     assert result["size"] == "2048x2048"
@@ -145,6 +147,8 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
     response_format = captured_form_data.get("response_format") or {}
     assert response_format.get("type") == "json_schema"
     assert response_format.get("json_schema", {}).get("strict") is True
+    schema_required = response_format.get("json_schema", {}).get("schema", {}).get("required") or []
+    assert "use_user_prompt" in schema_required
 
 
 def test_validate_task_model_params_rejects_unsupported_size(pipe_instance):
@@ -152,6 +156,7 @@ def test_validate_task_model_params_rejects_unsupported_size(pipe_instance):
         pipe_instance._validate_task_model_params(
             {
                 "prompt": "Make something",
+                "use_user_prompt": False,
                 "intent": "generate",
                 "size": "999x999",
                 "watermark": True,
@@ -166,6 +171,7 @@ def test_validate_task_model_params_rejects_unsupported_size(pipe_instance):
 def test_validate_task_model_params_strips_placeholders(pipe_instance):
     params = {
         "prompt": "Paint the dog [image:1] orange",
+        "use_user_prompt": False,
         "intent": "edit",
         "size": "2048x2048",
         "watermark": False,
@@ -180,6 +186,7 @@ def test_validate_task_model_params_strips_placeholders(pipe_instance):
     )
 
     assert result["prompt"] == "Paint the dog orange"
+    assert result["use_user_prompt"] is False
 
 
 @pytest.mark.asyncio
@@ -208,3 +215,200 @@ async def test_collect_conversation_and_images_handles_inline_data_uri(pipe_inst
     assert images[0]["data"] == base64_data
     assert last_user_text.startswith("Use this")
     assert images[0]["origin"] == {"type": "data_uri"}
+
+
+@pytest.mark.asyncio
+async def test_pipe_stream_emits_using_prompt_before_images(monkeypatch, pipe_instance):
+    async def fake_get_user(user_id):
+        return SimpleNamespace(id=user_id, settings={})
+
+    monkeypatch.setattr(pipe_instance, "_get_user_by_id", fake_get_user)
+
+    async def fake_analyse(*_, **__):
+        return {
+            "prompt": "A test prompt",
+            "use_user_prompt": False,
+            "intent": "generate",
+            "watermark": False,
+            "size": "2048x2048",
+            "use_reference_images": False,
+            "resize_target": None,
+            "notes": "",
+            "image_plan": [],
+            "status_message": "",
+        }
+
+    monkeypatch.setattr(pipe_instance, "_analyse_prompt_with_task_model", fake_analyse)
+
+    async def fake_upload(*_, **__):
+        return "/files/fake"
+
+    monkeypatch.setattr(pipe_instance, "_upload_image", fake_upload)
+
+    class _StubResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"url": "https://example.test/image.png"}], "usage": {}}
+
+        @property
+        def text(self):
+            return ""
+
+    class _StubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, *_, **__):
+            return _StubResponse()
+
+    monkeypatch.setattr(seedream_pipe.httpx, "AsyncClient", lambda *_, **__: _StubClient())
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings={})))
+    body = {"model": "chat-model", "stream": True, "messages": [{"role": "user", "content": "hello"}]}
+
+    pipe_instance.valves.API_KEY = "test"
+
+    response = await pipe_instance.pipe(
+        body=body,
+        __user__={"id": "user-1"},
+        __request__=request,
+        __event_emitter__=None,
+    )
+
+    first_chunk = None
+    async for chunk in response.body_iterator:
+        first_chunk = chunk
+        break
+
+    assert first_chunk is not None
+    chunk_text = first_chunk.decode("utf-8") if isinstance(first_chunk, (bytes, bytearray)) else str(first_chunk)
+    assert "Using prompt:" in chunk_text
+
+
+@pytest.mark.asyncio
+async def test_pipe_event_emitter_replace_keeps_prompt_visible(monkeypatch, pipe_instance):
+    async def fake_get_user(user_id):
+        return SimpleNamespace(id=user_id, settings={})
+
+    monkeypatch.setattr(pipe_instance, "_get_user_by_id", fake_get_user)
+
+    async def fake_analyse(*_, **__):
+        return {
+            "prompt": "A test prompt",
+            "use_user_prompt": False,
+            "intent": "generate",
+            "watermark": False,
+            "size": "2048x2048",
+            "use_reference_images": False,
+            "resize_target": None,
+            "notes": "",
+            "image_plan": [],
+            "status_message": "",
+        }
+
+    monkeypatch.setattr(pipe_instance, "_analyse_prompt_with_task_model", fake_analyse)
+
+    class _StubResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"url": "https://example.test/image.png"}], "usage": {}}
+
+        @property
+        def text(self):
+            return ""
+
+    class _StubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, *_, **__):
+            return _StubResponse()
+
+    monkeypatch.setattr(seedream_pipe.httpx, "AsyncClient", lambda *_, **__: _StubClient())
+
+    events = []
+
+    async def emitter(event_data):
+        events.append(event_data)
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings={})))
+    body = {"model": "chat-model", "stream": True, "messages": [{"role": "user", "content": "hello"}]}
+
+    pipe_instance.valves.API_KEY = "test"
+
+    response = await pipe_instance.pipe(
+        body=body,
+        __user__={"id": "user-1"},
+        __request__=request,
+        __event_emitter__=emitter,
+    )
+
+    # Drain stream to completion
+    async for _ in response.body_iterator:
+        pass
+
+    replace_events = [e for e in events if e.get("type") == "replace"]
+    assert replace_events, "expected at least one replace event"
+    assert "Using prompt:" in replace_events[0].get("data", {}).get("content", "")
+    assert "image" in replace_events[-1].get("data", {}).get("content", "")
+
+
+@pytest.mark.asyncio
+async def test_pipe_help_short_circuits(monkeypatch, pipe_instance):
+    async def fake_get_user(user_id):
+        return SimpleNamespace(id=user_id, settings={})
+
+    monkeypatch.setattr(pipe_instance, "_get_user_by_id", fake_get_user)
+
+    called = {"task": 0, "http": 0}
+
+    async def fake_analyse(*_, **__):
+        called["task"] += 1
+        raise AssertionError("task model should not be called for help")
+
+    monkeypatch.setattr(pipe_instance, "_analyse_prompt_with_task_model", fake_analyse)
+
+    class _StubClient:
+        async def __aenter__(self):
+            called["http"] += 1
+            raise AssertionError("http client should not be used for help")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(seedream_pipe.httpx, "AsyncClient", lambda *_, **__: _StubClient())
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings={})))
+    body = {"model": "chat-model", "stream": True, "messages": [{"role": "user", "content": "help"}]}
+
+    response = await pipe_instance.pipe(
+        body=body,
+        __user__={"id": "user-1"},
+        __request__=request,
+        __event_emitter__=None,
+    )
+
+    first_chunk = None
+    async for chunk in response.body_iterator:
+        first_chunk = chunk
+        break
+
+    assert first_chunk is not None
+    chunk_text = first_chunk.decode("utf-8") if isinstance(first_chunk, (bytes, bytearray)) else str(first_chunk)
+    assert "Seedream help" in chunk_text
+    assert called["task"] == 0
+    assert called["http"] == 0

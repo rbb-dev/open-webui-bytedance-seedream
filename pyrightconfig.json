@@ -2,5 +2,5 @@
   "venvPath": ".",
   "venv": ".venv",
   "extraPaths": [".external/open-webui/backend"],
-  "include": ["pipes", "tests"]
+  "include": ["bytedance_seedream.py", "tests"]
 }
