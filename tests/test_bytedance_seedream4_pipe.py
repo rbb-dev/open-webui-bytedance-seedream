@@ -46,12 +46,24 @@ def _install_stub_modules():
 
     main_mod = types.ModuleType("open_webui.main")
 
-    async def _stub_generate(*_, **__):  # pragma: no cover - patched in tests
+    async def _stub_generate_legacy(*_, **__):  # pragma: no cover - patched in tests
         raise RuntimeError("generate_chat_completions stub invoked")
 
-    setattr(main_mod, "generate_chat_completions", _stub_generate)
+    setattr(main_mod, "generate_chat_completions", _stub_generate_legacy)
     sys.modules["open_webui.main"] = main_mod
     setattr(open_webui, "main", main_mod)
+
+    utils_pkg = types.ModuleType("open_webui.utils")
+    sys.modules["open_webui.utils"] = utils_pkg
+
+    chat_mod = types.ModuleType("open_webui.utils.chat")
+
+    async def _stub_generate(*_, **__):  # pragma: no cover - patched in tests
+        raise RuntimeError("generate_chat_completion stub invoked")
+
+    setattr(chat_mod, "generate_chat_completion", _stub_generate)
+    sys.modules["open_webui.utils.chat"] = chat_mod
+    setattr(utils_pkg, "chat", chat_mod)
 
 
 _install_stub_modules()
@@ -72,29 +84,33 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
 
     monkeypatch.setattr(pipe_instance, "_get_user_by_id", fake_get_user)
 
-    expected = {
+    task_model_payload = {
         "prompt": "Resize this image to 2048x2048 and remove watermark [image:0]",
         "intent": "edit",
-        "use_reference_images": True,
         "watermark": False,
         "size": "2048x2048",
         "resize_target": {"width": 2048, "height": 2048},
-        "notes": "resize and edit",
-        "status_message": "Editing with resize",
         "image_plan": [
-            {"index": 0, "action": "use", "role": "base", "target_size": "2048x2048"}
+            {"index": 0, "action": "use", "role": "base"}
         ],
     }
 
-    async def fake_generate_chat_completions(*_, **__):
-        return {"choices": [{"message": {"content": json.dumps(expected)}}]}
+    captured_form_data = {}
 
-    monkeypatch.setattr(seedream_pipe, "generate_chat_completions", fake_generate_chat_completions)
+    async def fake_generate_chat_completion(*_, **__):
+        form_data = __.get("form_data") or {}
+        captured_form_data.update(form_data)
+        return {"choices": [{"message": {"content": json.dumps(task_model_payload)}}]}
+
+    monkeypatch.setattr(seedream_pipe, "generate_chat_completion", fake_generate_chat_completion)
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings={})))
     conversation = [
         {"message_index": 0, "role": "user", "text": "resize this image", "image_refs": [0]}
     ]
+
+    request.app.state.config = SimpleNamespace(TASK_MODEL_EXTERNAL="task-model", TASK_MODEL="")
+    request.app.state.MODELS = {"task-model": {"id": "task-model"}, "chat-model": {"id": "chat-model"}}
 
     result = await pipe_instance._analyse_prompt_with_task_model(
         conversation=conversation,
@@ -112,7 +128,7 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
         },
         raw_user_prompt="resize this image",
         __user__={"id": "user-1"},
-        body={},
+        body={"model": "chat-model"},
         user_obj=None,
         __request__=request,
         emitter=None,
@@ -123,19 +139,24 @@ async def test_analyse_prompt_with_task_model_returns_valid_payload(monkeypatch,
     assert result["use_reference_images"] is True
     assert result["size"] == "2048x2048"
     assert result["resize_target"] == {"width": 2048, "height": 2048}
-    assert result["notes"] == "resize and edit"
-    assert result["image_plan"] == expected["image_plan"]
-    assert result["status_message"] == "Editing with resize"
+    assert result["image_plan"] == [{"index": 0, "action": "use", "role": "base", "target_size": None}]
+    assert captured_form_data.get("temperature") == 0
+    assert "max_tokens" not in captured_form_data
+    response_format = captured_form_data.get("response_format") or {}
+    assert response_format.get("type") == "json_schema"
+    assert response_format.get("json_schema", {}).get("strict") is True
 
 
 def test_validate_task_model_params_rejects_unsupported_size(pipe_instance):
     with pytest.raises(ValueError):
         pipe_instance._validate_task_model_params(
             {
+                "prompt": "Make something",
                 "intent": "generate",
                 "size": "999x999",
-                "use_reference_images": False,
                 "watermark": True,
+                "resize_target": None,
+                "image_plan": [],
             },
             image_count=0,
             fallback_prompt="fallback",
@@ -147,9 +168,9 @@ def test_validate_task_model_params_strips_placeholders(pipe_instance):
         "prompt": "Paint the dog [image:1] orange",
         "intent": "edit",
         "size": "2048x2048",
-        "use_reference_images": True,
         "watermark": False,
-        "image_plan": [],
+        "resize_target": None,
+        "image_plan": [{"index": 0, "action": "use", "role": "base"}],
     }
 
     result = pipe_instance._validate_task_model_params(

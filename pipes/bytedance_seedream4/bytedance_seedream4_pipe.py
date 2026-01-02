@@ -1,7 +1,7 @@
 """
 title: ByteDance Seedream 4.0 Image Generation & Editing Pipe
 description: ByteDance Seedream 4.0 plugin with task model integration
-id: seedream-4-0
+id: seedream-4-5
 author: rbb-dev
 author_url: https://github.com/rbb-dev/
 version: 0.9.1
@@ -26,14 +26,14 @@ import logging
 import re
 import time
 import uuid
-from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple
+from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple, Literal
 import httpx
 from PIL import Image
 from fastapi import Request, UploadFile, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from open_webui.routers.files import upload_file
 from open_webui.models.users import UserModel, Users
-from open_webui.main import generate_chat_completions
+from open_webui.utils.chat import generate_chat_completion
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from starlette.datastructures import Headers
@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 # Avoid 'No handler could be found' warnings; rely on host/root handlers.
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
+
+TASK_MODEL_RESPONSE_SCHEMA_NAME = "seedream_task_plan"
 
 
 class Pipe:
@@ -52,13 +54,26 @@ class Pipe:
         # Logging
         ENABLE_LOGGING: bool = Field(default=False, description="Enable info/debug logs for this plugin. When False, only errors are logged.")
         # Model and basic generation options
-        MODEL: str = Field(default="bytedance-seedream-4-0-250828", description="Doubao Seedream 4.0 model id")
+        MODEL: str = Field(default="doubao-seedream-4-5-251128", description="Doubao Seedream 4.5")
         GUIDANCE_SCALE: int = Field(
             default=3,
             description="Default guidance scale (1-20). Larger values stay closer to the prompt per CometAPI docs.",
         )
-        # Task model settings
-        TASK_MODEL: str = Field(default="gpt-4.1-mini", description="Task model id used when Open WebUI does not supply one.")
+        task_model_mode: Literal["internal", "external"] = Field(
+            default="external",
+            description="Which global Task Model to use. "
+            "'internal' uses Open WebUI TASK_MODEL, 'external' uses TASK_MODEL_EXTERNAL.",
+        )
+        task_model_fallback: Literal[
+            "none",
+            "other_task_model",
+            "chat_model",
+        ] = Field(
+            default="none",
+            description="Fallback strategy if Task Model execution fails. "
+            "'none' disables fallback, 'other_task_model' switches between internal/external, "
+            "'chat_model' uses the current chat model.",
+        )
         # Defaults when task model output is missing optional fields
         WATERMARK: bool = Field(default=False, description="Default watermark preference when task model omits the field.")
         DEFAULT_SIZE: str = Field(default="2048x2048", description="Default image size when not specified or unsupported size requested.")
@@ -100,6 +115,30 @@ class Pipe:
         logger.setLevel(logging.INFO if enabled else logging.ERROR)
         # Rely on host/root handlers; do not attach our own to avoid duplicates.
         logger.propagate = True
+
+    @staticmethod
+    def _safe_task_model_log_payload(form_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Redact task-model payload for debug logs (no prompts, no messages)."""
+        response_format = form_data.get("response_format") or {}
+        json_schema = response_format.get("json_schema") or {}
+        messages = form_data.get("messages") or []
+        roles: List[str] = []
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict) and isinstance(msg.get("role"), str):
+                    roles.append(msg["role"])
+        return {
+            "model": form_data.get("model"),
+            "temperature": form_data.get("temperature"),
+            "stream": form_data.get("stream"),
+            "response_format": {
+                "type": response_format.get("type"),
+                "name": json_schema.get("name"),
+                "strict": json_schema.get("strict"),
+            },
+            "messages": {"count": len(messages) if isinstance(messages, list) else 0, "roles": roles},
+            "metadata": form_data.get("metadata"),
+        }
 
     async def emit_status(
         self,
@@ -318,20 +357,20 @@ Processing checklist BEFORE you answer:
 1. CHECK IF REFERENCE IMAGES EXIST: Look at `reference_images.count`. If count > 0, there ARE images provided.
 2. CHECK IF THE PROMPT REFERENCES THE PROVIDED IMAGES: Look for words like "this", "these", "the image", "the images", "first image", "second image", "both images", "all images", "uploaded", "attached", "provided", or image placeholders like [image:0].
 3. DETERMINE INTENT - THIS IS CRITICAL:
-   - IF reference images exist (count > 0) AND the prompt references them → ALWAYS use intent="edit" and use_reference_images=true
-   - IF reference images exist BUT the prompt says to create something completely new/different/unrelated → use intent="generate" and use_reference_images=false
-   - IF no reference images exist (count = 0) → ALWAYS use intent="generate" and use_reference_images=false
+   - IF reference images exist (count > 0) AND the prompt references them → ALWAYS use intent="edit" and select at least one image with action="use"
+   - IF reference images exist BUT the prompt says to create something completely new/different/unrelated → use intent="generate" and set all images to action="ignore"
+   - IF no reference images exist (count = 0) → ALWAYS use intent="generate"
 4. Determine the final output size, making sure it is one of the supported sizes ({sizes_list}).
 5. Decide watermark behaviour, and craft short explanations for the UI.
 
 CRITICAL INTENT DECISION RULES (read this carefully):
 
 THE CORE PRINCIPLE:
-- If the user's prompt REFERENCES the provided images in ANY way (directly or implicitly), use intent="edit" and use_reference_images=true.
+- If the user's prompt REFERENCES the provided images in ANY way (directly or implicitly), use intent="edit" and select image(s) with action="use".
 - The examples below are NOT exhaustive lists of exact phrases - they teach you the PATTERN to recognize. Use your language understanding to identify similar intents even with completely different wording.
 - Think about what the user WANTS TO DO, not just the exact words they use.
 
-ALWAYS USE intent="edit" AND use_reference_images=true AND mark images with action="use" WHEN the user wants to:
+ALWAYS USE intent="edit" AND mark images with action="use" WHEN the user wants to:
 
 1. **Work with/modify the provided images** - Pattern examples (use your understanding to recognize variations):
    - "edit [this/the/these] image(s)", "change [this/the] image", "modify [this/the] image", "adjust [this/the] image", "update [this/the] image", "alter [this/the] image", "tweak [this/the] image", "improve [this/the] image", "enhance [this/the] image", "fix [this/the] image", "correct [this/the] image"
@@ -368,7 +407,7 @@ KEY INSIGHT - Recognize these PATTERNS:
 - Positional references (first, second, both, all) → referring to specific provided images
 - ANY phrasing where the user clearly wants to DO SOMETHING WITH the images they provided
 
-ONLY USE intent="generate" AND use_reference_images=false WHEN:
+ONLY USE intent="generate" WHEN:
 - User wants something COMPLETELY NEW and UNRELATED to provided images: "create a NEW image of [X]", "make a DIFFERENT image of [X]", "generate an image of [X]", "draw [X]", "show me [X]", "produce an image of [X]"
 - User EXPLICITLY ignores provided images: "ignore the images and create [X]", "instead create [X]", "forget the images, make [X]", "don't use the images, make [X]"
 - User uses indefinite articles for NEW things: "create AN image of [X]", "make A picture of [X]" (NOT "create THE image..." which refers to provided ones)
@@ -378,108 +417,79 @@ CRITICAL DECISION RULE:
 When in doubt, if reference images exist and the prompt could reasonably be interpreted as working with those images (even slightly), choose intent="edit". It's better to use the provided images than to incorrectly ignore them and generate something unrelated.
 
 EXAMPLES TO LEARN FROM:
+Note: examples may omit required keys for brevity; your actual output must include all keys required by the schema.
 
 Example 1 - MERGE/COMBINE (ALWAYS EDIT):
 Input: "merge the images"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 2 - CHANGE SPECIFIC IMAGE (ALWAYS EDIT):
 Input: "change the first image to daytime"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "ignore"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "ignore"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 3 - EDIT THIS IMAGE (ALWAYS EDIT):
 Input: "edit the images and merge them"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 4 - REMOVE FROM IMAGE (ALWAYS EDIT):
 Input: "edit the images to remove white line"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "base"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "base"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 5 - BLEND/COMPOSITE (ALWAYS EDIT):
 Input: "blend these two images together"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}, {{"index": 1, "action": "use", "role": "reference"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 6 - MAKE THE IMAGE X (ALWAYS EDIT):
 Input: "make the image darker"
 reference_images.count: 1
-CORRECT OUTPUT: {{"intent": "edit", "use_reference_images": true, "image_plan": [{{"index": 0, "action": "use", "role": "base"}}]}}
-WRONG OUTPUT: {{"intent": "generate", "use_reference_images": false}} ← NEVER DO THIS!
+CORRECT OUTPUT: {{"intent": "edit", "image_plan": [{{"index": 0, "action": "use", "role": "base"}}]}}
+WRONG OUTPUT: {{"intent": "generate"}} ← NEVER DO THIS!
 
 Example 7 - NEW UNRELATED IMAGE (GENERATE):
 Input: "create a new image of a sunset over mountains"
 reference_images.count: 0
-CORRECT OUTPUT: {{"intent": "generate", "use_reference_images": false, "image_plan": []}}
+CORRECT OUTPUT: {{"intent": "generate", "image_plan": []}}
 
 Example 8 - DIFFERENT IMAGE DESPITE REFERENCES (GENERATE):
 Input: "ignore the uploaded images, draw me a cat instead"
 reference_images.count: 2
-CORRECT OUTPUT: {{"intent": "generate", "use_reference_images": false, "image_plan": [{{"index": 0, "action": "ignore"}}, {{"index": 1, "action": "ignore"}}]}}
+CORRECT OUTPUT: {{"intent": "generate", "image_plan": [{{"index": 0, "action": "ignore"}}, {{"index": 1, "action": "ignore"}}]}}
 
 Always respond with ONLY JSON (no markdown fences, no backticks, no prose). The response MUST match this schema:
 {{
-  "prompt": string,                        // clean natural-language prompt to send to the API (no placeholders like [image:2])
-  "intent": "generate" | "edit",          // FOLLOW THE RULES ABOVE CAREFULLY
-  "watermark": boolean,                     // true = add watermark, false = no watermark
-  "size": string,                           // one of: {sizes_list}
-  "resize_target": {{"width": int, "height": int}} | null,  // desired final width/height when user explicitly asks to resize
-  "use_reference_images": boolean,          // true if and only if at least one image has action="use"
+  "prompt": string,                // clean prompt to send to the API (NO placeholders like [image:2])
+  "intent": "generate" | "edit",   // follow the intent rules above
+  "watermark": boolean,            // true = add watermark, false = no watermark
+  "size": string,                  // one of: {sizes_list}
+  "resize_target": {{"width": int, "height": int}} | null,  // always include this key; use null when not requested
   "image_plan": [
     {{
-      "index": int,                         // index from reference_images.details
-      "action": "use" | "ignore",         // "use" when the image participates, "ignore" otherwise
-      "role": "base" | "reference" | "style" | "mask", // describe how the image is used
-      "target_size": string | null          // per-image resize from {sizes_list} when that image is off-spec
+      "index": int,                // index from reference_images.details
+      "action": "use" | "ignore",  // use when the image participates
+      "role": "base" | "reference" | "style" | "mask"
     }}
-  ],
-  "status_message": string,                // <=120 chars, short sentence describing what will happen (shown to user)
-  "notes": string                          // <=120 chars, internal reasoning or highlights
+  ]
 }}
 
-FIELD REQUIREMENTS:
-
-- `prompt`: REQUIRED. Write the exact text we should send to the downstream API. Use clear natural language, mention the desired scene/edit explicitly, and NEVER include placeholder tokens like `[image:2]` or other markup—describe the images instead (e.g., "Merge the two uploaded images together"). Keep it concise but complete.
-
-- `intent`: FOLLOW THE RULES ABOVE. When in doubt: if reference images exist and the prompt mentions them (using "the", "this", "these", "merge", "combine", "change the image", etc.), USE "edit". Do not overthink this.
-
-- `watermark`: Professional/commercial/portfolio/headshot/logo work → false. Casual, meme, playful, or social media content → true. When unsure, apply the defaults and justify in `notes`.
-
-- `size` (FINAL OUTPUT):
-    1. The downstream API accepts ONLY the supported sizes listed above. Every final request must use one of them.
-    2. Parse any dimension/ratio/"k" wording from the prompt. If the user specifies something unsupported, map it to the closest allowed size by balancing aspect ratio and pixel count.
-    3. When editing, prefer the primary reference image's size if it already matches a supported option; otherwise map it to the nearest supported size and mention the mapping in `notes`.
-    4. Document any trade-offs (e.g., "user asked for 2500×1500 so mapped to 2560×1440").
-
-- `resize_target` (FINAL OUTPUT DIMENSIONS): Populate only when the user explicitly requests a different final size/resolution. Use integer values that correspond to the chosen `size`. Leave null when editing without resize instructions and the chosen `size` already matches the reference.
-
-- `image_plan` (PER-IMAGE ACTIONS):
-    • Provide one entry for every image in `reference_images.details`, even if ignored.
-    • `action`: "use" when the image participates in the edit/generation, otherwise "ignore".
-    • `role` guidelines: "base" = primary image being edited, "reference" = additional visual guidance, "style" = style/lighting reference, "mask" = mask/cutout.
-    • When merging/combining/blending multiple images, mark the first as "base" and others as "reference".
-    • `target_size`: REQUIRED whenever that image's native width/height does not exactly match an allowed size. Choose the closest supported size so the pipeline knows to resize before sending to the API. Leave null only when the image already matches an allowed size or when the image is ignored.
-
-- `use_reference_images`: MUST be true if and only if at least one `image_plan` entry has `action":"use"`. MUST be false otherwise. This is a consistency check—make sure it matches your image_plan!
-
-- `status_message`: A concise sentence (<=120 chars) summarising the plan for the UI, e.g., "Merging 2 images at 2048x2048". Mention intent, selected images, and final size when possible.
-
-- `notes`: Mention crucial reasoning—size mappings, ignored images, ambiguity resolutions. Keep it <=120 chars.
-
-General rules:
-- When multiple reference images are supplied and the prompt says to merge/combine/blend them, mark them ALL with action="use".
-- Never invent metadata that is not present. Base your decisions solely on the provided prompt, defaults, and reference image details.
-- The output MUST be pure JSON with the exact keys described. No code fences, no backticks, no prose outside the JSON.
-- REMEMBER: If the user references the provided images in ANY way (using "the", "this", "these", or image-related verbs like "merge", "combine", "change", "edit"), YOU MUST use intent="edit" and use_reference_images=true!
+Extra rules:
+- prompt MUST NOT include placeholder tokens like [image:2]; describe images as "the uploaded image(s)" instead.
+- If intent="edit", image_plan MUST contain at least one entry with action="use".
+- Prefer including one image_plan entry per provided reference image (use or ignore), keeping indices consistent.
+- Do not output any extra keys not shown in the schema.
+- Always include resize_target; use null when not applicable.
 """
+
+        response_format = self._task_model_response_format(supported_sizes)
 
         has_images = bool((image_context or {}).get("count", 0))
 
@@ -496,43 +506,56 @@ General rules:
         }
 
         try:
-            task_model = self._resolve_task_model(body, user_obj, __request__)
             await self.emit_status("Analysing prompt...", emitter=emitter)
             resolved_user = user_obj or await self._get_user_by_id(__user__["id"])
             if not resolved_user:
                 logger.error("Unable to resolve user for task model call")
                 raise RuntimeError("user_lookup_failed")
 
-            form_data = {
-                "model": task_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt.strip()},
-                    {"role": "user", "content": json.dumps(task_payload, ensure_ascii=True)},
-                ],
-                "max_tokens": 200,
-                "temperature": 0.1,
-                "stream": False,
-            }
-            logger.info("Task model request payload: %s", json.dumps(form_data, ensure_ascii=False))
+            chat_model_id = body.get("model") if isinstance(body, dict) else None
+            candidates = self._task_model_candidates(__request__, chat_model_id=chat_model_id)
+            if not candidates:
+                raise RuntimeError(
+                    "No Task Model configured (TASK_MODEL/TASK_MODEL_EXTERNAL) and no fallback available."
+                )
 
-            response = await generate_chat_completions(
-                form_data=form_data,
-                user=resolved_user,
-                request=__request__,
-            )
-            content = await self._read_model_response_content(response)
-            logger.info("Task model raw response: %s", content)
-            if not content:
-                raise RuntimeError("task_model_empty_response")
+            last_error: Optional[Exception] = None
+            params: Any = None
+            for model_id in candidates:
+                try:
+                    form_data = {
+                        "model": model_id,
+                        "messages": [
+                            {"role": "system", "content": system_prompt.strip()},
+                            {"role": "user", "content": json.dumps(task_payload, ensure_ascii=True)},
+                        ],
+                        "temperature": 0,
+                        "stream": False,
+                        "response_format": response_format,
+                        "metadata": {"task": "seedream_task_plan"},
+                    }
+                    if logger.isEnabledFor(logging.DEBUG):
+                        safe_payload = self._safe_task_model_log_payload(form_data)
+                        logger.debug(
+                            "Task model request payload: %s",
+                            json.dumps(safe_payload, ensure_ascii=False, default=str),
+                        )
 
-            json_blob = self._extract_first_json_object(content)
-            if not json_blob:
-                logger.debug(f"Task model raw response: {content[:1000]}")
-                raise RuntimeError("task_model_missing_json")
+                    response = await generate_chat_completion(
+                        request=__request__, form_data=form_data, user=resolved_user
+                    )
+                    params = await self._read_task_model_response_json(response)
+                    if not isinstance(params, dict):
+                        raise RuntimeError("task_model_invalid_schema")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    continue
 
-            params = json.loads(json_blob)
             if not isinstance(params, dict):
-                raise RuntimeError("task_model_invalid_schema")
+                raise RuntimeError(
+                    f"Task model execution failed for all candidates; last_error={last_error}"
+                ) from last_error
 
             image_count = (image_context or {}).get("count", 0)
             validated_params = self._validate_task_model_params(
@@ -540,14 +563,129 @@ General rules:
                 image_count,
                 fallback_prompt=raw_user_prompt or "",
             )
-            logger.info(f"Task model determined parameters: {validated_params}")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "Task model result: intent=%s size=%s watermark=%s images_used=%s",
+                    validated_params.get("intent"),
+                    validated_params.get("size"),
+                    validated_params.get("watermark"),
+                    len([e for e in (validated_params.get("image_plan") or []) if e.get("action") == "use"]),
+                )
             return validated_params
         except Exception as exc:
-            logger.error(f"Task model call failed: {exc}")
+            logger.error("Task model call failed: %s", exc)
             import traceback
 
-            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Full traceback: %s", traceback.format_exc())
             raise
+
+    def _task_model_candidates(self, request: Request, chat_model_id: Optional[str]) -> List[str]:
+        internal = getattr(request.app.state.config, "TASK_MODEL", "") or ""
+        external = getattr(request.app.state.config, "TASK_MODEL_EXTERNAL", "") or ""
+
+        primary = internal if self.valves.task_model_mode == "internal" else external
+        other = external if self.valves.task_model_mode == "internal" else internal
+
+        candidates: List[str] = []
+        primary = (primary or "").strip()
+        if primary:
+            candidates.append(primary)
+
+        if self.valves.task_model_fallback == "other_task_model":
+            other = (other or "").strip()
+            if other and other not in candidates:
+                candidates.append(other)
+        elif self.valves.task_model_fallback == "chat_model":
+            chat_model_id = (chat_model_id or "").strip()
+            if chat_model_id and chat_model_id not in candidates:
+                candidates.append(chat_model_id)
+
+        return candidates
+
+    def _task_model_response_format(self, supported_sizes: List[str]) -> Dict[str, Any]:
+        schema: Dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+            # OpenAI/OpenRouter Structured Outputs expects all properties to be required;
+            # optional fields are represented as nullable values.
+            "required": ["prompt", "intent", "size", "watermark", "resize_target", "image_plan"],
+            "properties": {
+                "prompt": {"type": "string", "minLength": 1},
+                "intent": {"type": "string", "enum": ["generate", "edit"]},
+                "watermark": {"type": "boolean"},
+                "size": {"type": "string", "enum": supported_sizes},
+                "resize_target": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "required": ["width", "height"],
+                    "properties": {
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1},
+                    },
+                },
+                "image_plan": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["index", "action", "role"],
+                        "properties": {
+                            "index": {"type": "integer", "minimum": 0},
+                            "action": {"type": "string", "enum": ["use", "ignore"]},
+                            "role": {
+                                "type": "string",
+                                "enum": ["base", "reference", "style", "mask"],
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": TASK_MODEL_RESPONSE_SCHEMA_NAME,
+                "strict": True,
+                "schema": schema,
+            },
+        }
+
+    async def _read_task_model_response_json(self, response: Any) -> Dict[str, Any]:
+        if hasattr(response, "body_iterator"):
+            content = await self._read_model_response_content(response)
+            if not content:
+                raise RuntimeError("task_model_empty_response")
+            return json.loads(content)
+
+        if not isinstance(response, dict):
+            raise TypeError(f"unexpected task model response type: {type(response).__name__}")
+
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("task_model_no_choices")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise TypeError(f"unexpected choice type: {type(first_choice).__name__}")
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+
+        refusal = message.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            raise RuntimeError(f"task_model_refusal: {refusal.strip()}")
+
+        content_value = message.get("content")
+        if isinstance(content_value, dict):
+            return content_value
+        if isinstance(content_value, str):
+            if not content_value.strip():
+                raise RuntimeError("task_model_empty_response")
+            return json.loads(content_value)
+
+        raise TypeError(f"unexpected task model content type: {type(content_value).__name__}")
 
     def _validate_size_choice(self, value: Any) -> str:
         """Ensure the supplied size string matches supported entries."""
@@ -590,22 +728,24 @@ General rules:
         """Validate and sanitise parameters coming back from the task model."""
         prompt_value = params.get("prompt")
         if not isinstance(prompt_value, str) or not prompt_value.strip():
-            prompt_text = self._strip_image_placeholders(fallback_prompt)
-            logger.warning("Task model response missing 'prompt'; falling back to user prompt")
-        else:
-            prompt_text = self._strip_image_placeholders(prompt_value)
+            raise ValueError("Task model response missing 'prompt'")
+        prompt_text = self._strip_image_placeholders(prompt_value)
 
         intent_raw = str(params.get("intent", "generate")).lower()
         intent = intent_raw if intent_raw in {"generate", "edit"} else "generate"
 
-        size = self._validate_size_choice(params.get("size", self.valves.DEFAULT_SIZE))
+        if "size" not in params:
+            raise ValueError("Task model response missing 'size'")
+        size = self._validate_size_choice(params.get("size"))
 
-        watermark = bool(params.get("watermark", self.valves.WATERMARK))
-        use_reference_images = bool(params.get("use_reference_images", False))
-        if image_count <= 0:
-            use_reference_images = False
+        if "watermark" not in params:
+            raise ValueError("Task model response missing 'watermark'")
+        watermark = bool(params.get("watermark"))
+        use_reference_images = False
 
         resize_target = params.get("resize_target")
+        if "resize_target" not in params:
+            raise ValueError("Task model response missing 'resize_target'")
         validated_resize: Optional[Dict[str, int]] = None
         if isinstance(resize_target, dict):
             width = resize_target.get("width")
@@ -617,8 +757,10 @@ General rules:
         notes_str = notes.strip() if isinstance(notes, str) else ""
 
         image_plan_entries: List[Dict[str, Any]] = []
-        raw_plan = params.get("image_plan") or []
-        if isinstance(raw_plan, list) and image_count > 0:
+        raw_plan = params.get("image_plan")
+        if not isinstance(raw_plan, list):
+            raise ValueError("Task model response missing 'image_plan'")
+        if image_count > 0:
             for entry in raw_plan:
                 if not isinstance(entry, dict):
                     continue
@@ -631,29 +773,22 @@ General rules:
                 role = str(entry.get("role", "reference")).lower()
                 if role not in {"base", "reference", "style", "mask"}:
                     role = "reference"
-                target_size = entry.get("target_size")
-                validated_target_size = None
-                if target_size:
-                    try:
-                        validated_target_size = self._validate_size_choice(target_size)
-                    except ValueError:
-                        validated_target_size = None
                 image_plan_entries.append(
                     {
                         "index": index,
                         "action": action,
                         "role": role,
-                        "target_size": validated_target_size,
+                        "target_size": None,
                     }
                 )
 
-        use_reference_images = use_reference_images or any(
-            entry.get("action") == "use" for entry in image_plan_entries
-        )
+        use_reference_images = any(entry.get("action") == "use" for entry in image_plan_entries)
 
-        if intent == "edit" and not use_reference_images:
-            logger.info("Task model intent was 'edit' without usable reference images; switching to 'generate'.")
-            intent = "generate"
+        if intent == "edit":
+            if image_count <= 0:
+                raise ValueError("Task model returned intent='edit' without reference images")
+            if not use_reference_images:
+                raise ValueError("Task model returned intent='edit' without selecting images")
 
         status_message = params.get("status_message")
         status_message = status_message.strip() if isinstance(status_message, str) else ""
@@ -669,53 +804,6 @@ General rules:
             "image_plan": image_plan_entries,
             "status_message": status_message,
         }
-
-    def _resolve_task_model(
-        self,
-        body: Dict[str, Any],
-        user_obj: Optional[UserModel],
-        __request__: Request,
-    ) -> str:
-        """Resolve which task model to call using Open WebUI preferences."""
-
-        def _extract(source: Any) -> Optional[str]:
-            """Normalise candidate objects and pull out the first task-model identifier."""
-            mapping = self._object_to_mapping(source)
-            for key in (
-                "task_model",
-                "task_model_id",
-                "task_model_name",
-                "taskModel",
-            ):
-                value = mapping.get(key)
-                if isinstance(value, str):
-                    value = value.strip()
-                    if value:
-                        return value
-            return None
-
-        for candidate_source in (
-            body,
-            body.get("metadata") if isinstance(body, dict) else None,
-        ):
-            candidate = _extract(candidate_source)
-            if candidate:
-                return candidate
-
-        if user_obj:
-            for candidate_source in (user_obj, getattr(user_obj, "settings", None)):
-                candidate = _extract(candidate_source)
-                if candidate:
-                    return candidate
-
-        app = getattr(__request__, "app", None)
-        state = getattr(app, "state", None) if app else None
-        settings = getattr(state, "settings", None) if state else None
-        candidate = _extract(settings)
-        if candidate:
-            return candidate
-
-        return self.valves.TASK_MODEL
 
     @staticmethod
     def _object_to_mapping(source: Any) -> Dict[str, Any]:
@@ -763,7 +851,7 @@ General rules:
 
     async def pipes(self) -> List[dict]:
         """Return the manifest entry consumed by Open WebUI."""
-        return [{"id": "seedream-4-0", "name": "ByteDance: Seedream 4.0"}]
+        return [{"id": "seedream-4-5", "name": "ByteDance: Seedream 4.5"}]
 
     async def pipe(
         self,
@@ -846,13 +934,13 @@ General rules:
                 }
                 task_notes = dynamic_params.get("notes") or ""
                 if task_notes:
-                    logger.info(f"Task model notes: {task_notes}")
+                    logger.debug("Task model notes: %s", task_notes)
 
                 image_plan = dynamic_params.get("image_plan", [])
                 selected_images: List[Dict[str, str]] = []
                 selected_indices: List[int] = []
                 if image_plan:
-                    logger.info("Task model image plan: %s", image_plan)
+                    logger.debug("Task model image plan: %s", image_plan)
                     for directive in image_plan:
                         if directive.get("action") != "use":
                             continue
@@ -865,7 +953,7 @@ General rules:
                     selected_images = images[:]
 
                 if dynamic_params["intent"] == "edit" and not selected_images:
-                    logger.info(
+                    logger.debug(
                         "Task model intent 'edit' but no usable reference images selected; falling back to generation mode."
                     )
 
@@ -886,7 +974,7 @@ General rules:
                             continue
                         approx_size = self._estimate_base64_size_bytes(b64)
                         if approx_size and approx_size > 10 * 1024 * 1024:
-                            logger.info("Skipping image >10MB after decode estimate")
+                            logger.warning("Skipping image >10MB after decode estimate")
                             continue
                         image_uris.append(f"data:{mime};base64,{b64}")
                     if image_uris:
@@ -925,7 +1013,6 @@ General rules:
                             "model": json_data.get("model"),
                             "size": json_data.get("size"),
                             "watermark": json_data.get("watermark"),
-                            "prompt": json_data.get("prompt"),
                             "guidance_scale": json_data.get("guidance_scale"),
                             "n": json_data.get("n"),
                         }
@@ -937,19 +1024,24 @@ General rules:
                             )
                             redacted_payload["image"] = "<omitted base64>"
                         logger.info(
-                            "Request payload summary: prompt=%s | size=%s | watermark=%s | images=%s",
-                            redacted_payload.get("prompt"),
+                            "Request payload summary: model=%s | size=%s | watermark=%s | images=%s",
+                            redacted_payload.get("model"),
                             redacted_payload.get("size"),
                             redacted_payload.get("watermark"),
                             redacted_payload.get("image_count", 0),
                         )
-                        logger.info("Request payload detail: %s", redacted_payload)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("Request payload detail: %s", redacted_payload)
                         response = await client.post(endpoint, json=json_data)
                         # Handle array fallback for older gateways
                         if response.status_code == 400 and isinstance(json_data.get("image"), list):
                             try:
                                 msg = response.text
-                                logger.debug(f"API Error Response: {json.dumps(response.json(), indent=2)}")
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "API Error Response: %s",
+                                        json.dumps(response.json(), indent=2),
+                                    )
                             except Exception:
                                 msg = ""
                             if ("image of type string" in msg or "unmarshal array into" in msg):
