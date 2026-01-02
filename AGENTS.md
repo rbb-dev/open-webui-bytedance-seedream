@@ -42,7 +42,9 @@ Repository-specific instructions for automated coding agents.
 - Use lightweight Conventional Commits: `fix:`, `feat:`, `chore:`.
 - Keep subjects imperative, under ~72 characters, and scoped.
 - Never run `git commit` until the user approves the exact commit message/details.
-  - If the user says “commit” but hasn’t approved a message yet, propose the subject + short body (what/why/tests) and ask for approval before committing.
+  - If the user says “commit” but hasn’t approved a message yet, propose the subject + short body (what/why) and ask for approval before committing.
+- Do not include a `Tests:` section in commit messages.
+- Do not include verification notes in commit messages (e.g. “checks run”, “tested with”, commands, etc.); keep commits to change descriptions only.
 - PRs should:
   - Explain the behavior change.
   - List valves/docs touched.

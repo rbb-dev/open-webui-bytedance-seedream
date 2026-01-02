@@ -145,7 +145,8 @@ class Pipe:
         """Remove placeholder tokens like [image:2] from prompts before sending to API."""
         if not text:
             return ""
-        return re.sub(r"\[image:\d+\]", "", text).strip()
+        stripped = re.sub(r"\[image:\d+\]", "", text)
+        return re.sub(r"\s+", " ", stripped).strip()
 
     def _build_reference_image_context(
         self,
@@ -1039,11 +1040,11 @@ General rules:
 
     async def _collect_conversation_and_images(
         self, messages: List[Dict[str, Any]]
-    ) -> tuple[List[Dict[str, Any]], List[Dict[str, str]], str]:
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
         """Capture the conversation text plus every referenced image."""
 
         conversation: List[Dict[str, Any]] = []
-        images: List[Dict[str, str]] = []
+        images: List[Dict[str, Any]] = []
         last_user_text = ""
 
         data_uri_pattern = re.compile(r"!\[[^\]]*\]\(data:([^;]+);base64,([^)]+)\)")
@@ -1110,18 +1111,7 @@ General rules:
                 image_refs.append(idx)
                 return f"[image:{idx}]"
 
-            if isinstance(content, list):
-                for item in content:
-                    if item.get("type") == "text":
-                        text_segments.append(item.get("text", ""))
-                    elif item.get("type") == "image_url":
-                        idx = await _ingest_url_source(item.get("image_url", {}).get("url", ""))
-                        placeholder = _register_placeholder(idx)
-                        if placeholder:
-                            text_segments.append(placeholder)
-            elif isinstance(content, str):
-                text_value = content
-
+            async def _replace_markdown_images(text_value: str) -> str:
                 while True:
                     match = data_uri_pattern.search(text_value)
                     if not match:
@@ -1156,7 +1146,21 @@ General rules:
                     replacement = placeholder or ""
                     text_value = text_value[: match.start()] + replacement + text_value[match.end():]
 
-                text_segments.append(text_value.strip())
+                return text_value
+
+            if isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        processed = await _replace_markdown_images(item.get("text", ""))
+                        text_segments.append(processed.strip())
+                    elif item.get("type") == "image_url":
+                        idx = await _ingest_url_source(item.get("image_url", {}).get("url", ""))
+                        placeholder = _register_placeholder(idx)
+                        if placeholder:
+                            text_segments.append(placeholder)
+            elif isinstance(content, str):
+                processed = await _replace_markdown_images(content)
+                text_segments.append(processed.strip())
             else:
                 text_segments.append("")
 
@@ -1174,7 +1178,7 @@ General rules:
 
         return conversation, images, last_user_text
 
-    async def _fetch_remote_image(self, url: str) -> Optional[Dict[str, str]]:
+    async def _fetch_remote_image(self, url: str) -> Optional[Dict[str, Any]]:
         """Download remote image URLs when provided by the client."""
         url = (url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
@@ -1203,7 +1207,7 @@ General rules:
     ) -> str:
         """Upload generated image bytes to the WebUI file store and return its URL."""
         try:
-            file_item = await run_in_threadpool(
+            file_item: Any = await run_in_threadpool(
                 upload_file,
                 request=__request__,
                 background_tasks=BackgroundTasks(),
@@ -1216,7 +1220,12 @@ General rules:
                 user=user,
                 metadata={"mime_type": mime_type},
             )
-            image_url = __request__.app.url_path_for("get_file_content_by_id", id=file_item.id)
+            file_item_id = getattr(file_item, "id", None)
+            if file_item_id is None and isinstance(file_item, dict):
+                file_item_id = file_item.get("id")
+            if not file_item_id:
+                raise RuntimeError("upload_file did not return a file id")
+            image_url = __request__.app.url_path_for("get_file_content_by_id", id=file_item_id)
             return image_url
         except Exception as e:
             logger.error(f"Image upload failed: {e}")

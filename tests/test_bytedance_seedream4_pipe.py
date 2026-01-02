@@ -21,10 +21,10 @@ def _install_stub_modules():
     def _stub_upload_file(*args, **kwargs):  # pragma: no cover - should never run in tests
         raise RuntimeError("upload_file stub invoked")
 
-    files_mod.upload_file = _stub_upload_file
-    routers.files = files_mod
+    setattr(files_mod, "upload_file", _stub_upload_file)
+    setattr(routers, "files", files_mod)
     sys.modules["open_webui.routers.files"] = files_mod
-    open_webui.routers = routers
+    setattr(open_webui, "routers", routers)
 
     models_pkg = types.ModuleType("open_webui.models")
     sys.modules["open_webui.models"] = models_pkg
@@ -39,9 +39,9 @@ def _install_stub_modules():
         def get_user_by_id(_):
             return None
 
-    users_mod.UserModel = UserModel
-    users_mod.Users = Users
-    models_pkg.users = users_mod
+    setattr(users_mod, "UserModel", UserModel)
+    setattr(users_mod, "Users", Users)
+    setattr(models_pkg, "users", users_mod)
     sys.modules["open_webui.models.users"] = users_mod
 
     main_mod = types.ModuleType("open_webui.main")
@@ -49,9 +49,9 @@ def _install_stub_modules():
     async def _stub_generate(*_, **__):  # pragma: no cover - patched in tests
         raise RuntimeError("generate_chat_completions stub invoked")
 
-    main_mod.generate_chat_completions = _stub_generate
+    setattr(main_mod, "generate_chat_completions", _stub_generate)
     sys.modules["open_webui.main"] = main_mod
-    open_webui.main = main_mod
+    setattr(open_webui, "main", main_mod)
 
 
 _install_stub_modules()

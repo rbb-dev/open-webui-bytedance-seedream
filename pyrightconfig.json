@@ -1,0 +1,6 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [".external/open-webui/backend"],
+  "include": ["pipes", "tests"]
+}
